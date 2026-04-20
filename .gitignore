@@ -1,41 +1,463 @@
-# Compiled Lua sources
-luac.out
+sim=require'sim'
+simIK=require'simIK'
+simUI=require'simUI'
 
-# luarocks build files
-*.src.rock
-*.zip
-*.tar.gz
+function sysCall_init()
+    vehicleReference=sim.getObject('./youBot_vehicleReference')
+    vehicleTarget=sim.getObject('./youBot_vehicleTargetPosition')
 
-# Object files
-*.o
-*.os
-*.ko
-*.obj
-*.elf
+    sim.setObjectParent(vehicleTarget,-1,true)
 
-# Precompiled Headers
-*.gch
-*.pch
+    wheelJoints={-1,-1,-1,-1}
+    wheelJoints[1]=sim.getObject('./rollingJoint_fl')
+    wheelJoints[2]=sim.getObject('./rollingJoint_rl')
+    wheelJoints[3]=sim.getObject('./rollingJoint_rr')
+    wheelJoints[4]=sim.getObject('./rollingJoint_fr')
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-*.def
-*.exp
+    previousForwBackVel=0
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+    local p=sim.getObjectPosition(vehicleReference,-1)
+    railX=p[1]
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+    -- Vision sensor path: change this if your sensor has another name
+    visionSensor=sim.getObject('/visionSensor')
 
+    detectedColor='NONE'
+    lastPrintedColor=''
+
+    ui=nil
+    graphHandle=-1
+    graphStreams={}
+end
+
+------------------------------------------------------------
+-- UI
+------------------------------------------------------------
+function createUI()
+    local xml = [[
+    <ui title="FYP IK / FK Monitor" closeable="false" resizeable="true" activate="false">
+        <label text="Joint 1:"/>
+        <label id="1" text="0"/>
+
+        <label text="Joint 2:"/>
+        <label id="2" text="0"/>
+
+        <label text="Joint 3:"/>
+        <label id="3" text="0"/>
+
+        <label text="Joint 4:"/>
+        <label id="4" text="0"/>
+
+        <label text="Joint 5:"/>
+        <label id="5" text="0"/>
+
+        <label text="Tip X Y Z:"/>
+        <label id="6" text="0 0 0"/>
+
+        <label text="Target X Y Z:"/>
+        <label id="7" text="0 0 0"/>
+
+        <label text="Pos Error:"/>
+        <label id="8" text="0"/>
+
+        <label text="Detected Color:"/>
+        <label id="9" text="NONE"/>
+    </ui>
+    ]]
+    ui=simUI.create(xml)
+end
+
+function updateUI()
+    if ui==nil then return end
+
+    local q={}
+    for i=1,#armJoints,1 do
+        q[i]=sim.getJointPosition(armJoints[i])
+        simUI.setLabelText(ui,i,string.format('%.3f rad',q[i]))
+    end
+
+    local tipPos=sim.getObjectPosition(gripperTip,-1)
+    local tgtPos=sim.getObjectPosition(gripperTarget,-1)
+
+    simUI.setLabelText(ui,6,string.format('%.3f  %.3f  %.3f',tipPos[1],tipPos[2],tipPos[3]))
+    simUI.setLabelText(ui,7,string.format('%.3f  %.3f  %.3f',tgtPos[1],tgtPos[2],tgtPos[3]))
+
+    local err=math.sqrt(
+        (tipPos[1]-tgtPos[1])^2 +
+        (tipPos[2]-tgtPos[2])^2 +
+        (tipPos[3]-tgtPos[3])^2
+    )
+    simUI.setLabelText(ui,8,string.format('%.5f m',err))
+    simUI.setLabelText(ui,9,detectedColor)
+end
+
+------------------------------------------------------------
+-- GRAPH
+------------------------------------------------------------
+function createGraphStreams()
+    local ok,handle=pcall(sim.getObject,'/IK_FK_Graph')
+    if ok then
+        graphHandle=handle
+
+        graphStreams.j1=sim.addGraphStream(graphHandle,'Joint1','rad',0)
+        graphStreams.j2=sim.addGraphStream(graphHandle,'Joint2','rad',0)
+        graphStreams.j3=sim.addGraphStream(graphHandle,'Joint3','rad',0)
+        graphStreams.j4=sim.addGraphStream(graphHandle,'Joint4','rad',0)
+        graphStreams.j5=sim.addGraphStream(graphHandle,'Joint5','rad',0)
+        graphStreams.err=sim.addGraphStream(graphHandle,'IK_Error','m',0)
+    else
+        graphHandle=-1
+    end
+end
+
+function updateGraph()
+    if graphHandle==-1 then return end
+
+    local q={}
+    for i=1,#armJoints,1 do
+        q[i]=sim.getJointPosition(armJoints[i])
+    end
+
+    local tipPos=sim.getObjectPosition(gripperTip,-1)
+    local tgtPos=sim.getObjectPosition(gripperTarget,-1)
+    local err=math.sqrt(
+        (tipPos[1]-tgtPos[1])^2 +
+        (tipPos[2]-tgtPos[2])^2 +
+        (tipPos[3]-tgtPos[3])^2
+    )
+
+    sim.setGraphStreamValue(graphHandle,graphStreams.j1,q[1])
+    sim.setGraphStreamValue(graphHandle,graphStreams.j2,q[2])
+    sim.setGraphStreamValue(graphHandle,graphStreams.j3,q[3])
+    sim.setGraphStreamValue(graphHandle,graphStreams.j4,q[4])
+    sim.setGraphStreamValue(graphHandle,graphStreams.j5,q[5])
+    sim.setGraphStreamValue(graphHandle,graphStreams.err,err)
+end
+
+------------------------------------------------------------
+-- VISION SENSOR COLOR DETECTION
+------------------------------------------------------------
+function detectColorFromVisionSensor()
+    if visionSensor==-1 then return end
+
+    local ok,img,res=pcall(sim.getVisionSensorImg,visionSensor)
+    if not ok or img==nil or res==nil then
+        return
+    end
+
+    local resX=res[1]
+    local resY=res[2]
+    if resX==nil or resY==nil then
+        return
+    end
+
+    local totalR=0
+    local totalG=0
+    local totalB=0
+    local cnt=0
+
+    local step=6
+
+    local x1=math.floor(resX*0.35)
+    local x2=math.floor(resX*0.65)
+    local y1=math.floor(resY*0.35)
+    local y2=math.floor(resY*0.65)
+
+    for y=y1,y2,step do
+        for x=x1,x2,step do
+            local idx=(y*resX+x)*3+1
+            local r=string.byte(img,idx) or 0
+            local g=string.byte(img,idx+1) or 0
+            local b=string.byte(img,idx+2) or 0
+
+            totalR=totalR+r
+            totalG=totalG+g
+            totalB=totalB+b
+            cnt=cnt+1
+        end
+    end
+
+    if cnt==0 then return end
+
+    local avgR=totalR/cnt
+    local avgG=totalG/cnt
+    local avgB=totalB/cnt
+
+    local newColor='UNKNOWN'
+
+    if avgR>avgG+25 and avgR>avgB+25 then
+        newColor='RED'
+    elseif avgG>avgR+25 and avgG>avgB+25 then
+        newColor='GREEN'
+    elseif avgR>100 and avgG>100 and avgB<90 then
+        newColor='YELLOW'
+    end
+
+    detectedColor=newColor
+
+    if detectedColor~=lastPrintedColor then
+        sim.addLog(sim.verbosity_scriptinfos,
+            string.format('[VISION] Detected Color = %s | AvgRGB = %.1f %.1f %.1f',
+            detectedColor,avgR,avgG,avgB)
+        )
+        lastPrintedColor=detectedColor
+    end
+end
+
+------------------------------------------------------------
+-- MOTION / GRIPPER
+------------------------------------------------------------
+function sysCall_actuation()
+    local relP=sim.getObjectPosition(vehicleTarget,vehicleReference)
+
+    local pParam=20
+    local maxV=3
+    local accelF=0.08
+
+    local forwBackVel=relP[2]*pParam
+
+    if math.abs(forwBackVel)>maxV then
+        forwBackVel=maxV*forwBackVel/math.abs(forwBackVel)
+    end
+
+    local df=forwBackVel-previousForwBackVel
+    if math.abs(df)>maxV*accelF then
+        df=(df/math.abs(df))*(maxV*accelF)
+    end
+
+    forwBackVel=previousForwBackVel+df
+
+    sim.setJointTargetVelocity(wheelJoints[1],-forwBackVel)
+    sim.setJointTargetVelocity(wheelJoints[2],-forwBackVel)
+    sim.setJointTargetVelocity(wheelJoints[3],-forwBackVel)
+    sim.setJointTargetVelocity(wheelJoints[4],-forwBackVel)
+
+    previousForwBackVel=forwBackVel
+
+    detectColorFromVisionSensor()
+    updateUI()
+    updateGraph()
+end
+
+function getConfig(handles)
+    local c={}
+    for i=1,#handles,1 do
+        c[i]=sim.getJointPosition(handles[i])
+    end
+    return c
+end
+
+function openGripper()
+    sim.writeCustomDataBlock(gripper,'activity','open')
+    sim.wait(0.3)
+end
+
+function closeGripper()
+    sim.writeCustomDataBlock(gripper,'activity','close')
+    sim.wait(0.3)
+end
+
+function setGripperTargetMovingWithVehicle()
+    sim.setObjectParent(gripperTarget,vehicleReference,true)
+end
+
+function setGripperTargetFixedToWorld()
+    sim.setObjectParent(gripperTarget,-1,true)
+end
+
+function waitToReachVehicleTargetPosition()
+    repeat
+        sim.step()
+        local p1=sim.getObjectPosition(vehicleTarget,-1)
+        local p2=sim.getObjectPosition(vehicleReference,-1)
+        local pError=math.abs(p2[2]-p1[2])
+    until (pError<0.005)
+end
+
+function setBoxCarried(boxHandle)
+    sim.setObjectInt32Param(boxHandle,sim.shapeintparam_static,1)
+    sim.setObjectInt32Param(boxHandle,sim.shapeintparam_respondable,0)
+    sim.resetDynamicObject(boxHandle)
+end
+
+function setBoxReleased(boxHandle)
+    sim.setObjectInt32Param(boxHandle,sim.shapeintparam_static,0)
+    sim.setObjectInt32Param(boxHandle,sim.shapeintparam_respondable,1)
+    sim.resetDynamicObject(boxHandle)
+end
+
+function attachBoxToGripper(boxHandle)
+    setBoxCarried(boxHandle)
+    sim.setObjectParent(boxHandle,gripperTip,true)
+    sim.resetDynamicObject(boxHandle)
+end
+
+function pickupBoxFromPlace(boxHandle,pickupConf)
+    local boxPos=sim.getObjectPosition(boxHandle,-1)
+
+    sim.setObjectPosition(vehicleTarget,{railX,boxPos[2]-0.18,0},-1)
+    waitToReachVehicleTargetPosition()
+    sim.wait(0.2)
+
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,pickupConf,nil,fkcb,armJoints)
+
+    setGripperTargetFixedToWorld()
+
+    boxPos=sim.getObjectPosition(boxHandle,-1)
+
+    local q=sim.getObjectPose(gripperTip,-1)
+
+    q[1]=boxPos[1]
+    q[2]=boxPos[2]
+    q[3]=boxPos[3]+0.12
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb,ikData,ikMetric)
+
+    openGripper()
+    sim.wait(0.15)
+
+    q[3]=boxPos[3]+0.03
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),{0.25},{0.2},{0.5},q,ikcb,ikData,ikMetric)
+
+    q[3]=boxPos[3]+0.018
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),{0.12},{0.08},{0.25},q,ikcb,ikData,ikMetric)
+
+    sim.wait(0.1)
+    closeGripper()
+    sim.wait(0.25)
+
+    attachBoxToGripper(boxHandle)
+    sim.wait(0.1)
+
+    q[3]=boxPos[3]+0.05
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),{0.18},{0.12},{0.35},q,ikcb,ikData,ikMetric)
+
+    q[3]=boxPos[3]+0.14
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb,ikData,ikMetric)
+
+    setGripperTargetMovingWithVehicle()
+end
+
+function placeBoxOnPad2(dropHandle, padHandle, boxHandle, approachOffset, startConf)
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,startConf,nil,fkcb,armJoints)
+
+    setGripperTargetFixedToWorld()
+
+    local dropPos=sim.getObjectPosition(dropHandle,-1)
+    local relPos=sim.getObjectPosition(dropHandle,padHandle)
+    local relOri=sim.getObjectOrientation(dropHandle,padHandle)
+
+    local q=sim.getObjectPose(gripperTip,-1)
+
+    q[1]=dropPos[1]
+    q[2]=dropPos[2]
+    q[3]=dropPos[3]+approachOffset
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb,ikData,ikMetric)
+
+    q[3]=dropPos[3]+0.01
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),{0.15},{0.1},{0.3},q,ikcb,ikData,ikMetric)
+
+    openGripper()
+    sim.wait(0.15)
+
+    sim.setObjectParent(boxHandle,-1,true)
+    sim.setObjectParent(boxHandle,padHandle,false)
+    sim.setObjectPosition(boxHandle,relPos,padHandle)
+    sim.setObjectOrientation(boxHandle,relOri,padHandle)
+
+    setBoxReleased(boxHandle)
+
+    q[3]=dropPos[3]+approachOffset
+    sim.moveToPose(-1,sim.getObjectPose(gripperTip,-1),ikSpeed,ikAccel,ikJerk,q,ikcb,ikData,ikMetric)
+
+    setGripperTargetMovingWithVehicle()
+end
+
+------------------------------------------------------------
+-- IK/FK CALLBACKS
+------------------------------------------------------------
+function ikcb(q,vel,accel,data)
+    sim.setObjectPose(data.target,q,-1)
+    simIK.handleGroup(data.ikEnv,data.ikGroup,{syncWorlds=true})
+end
+
+function fkcb(config,vel,accel,handles)
+    for i=1,#handles,1 do
+        sim.setJointTargetPosition(handles[i],config[i])
+    end
+end
+
+------------------------------------------------------------
+-- MAIN THREAD
+------------------------------------------------------------
+function sysCall_thread()
+    local base=sim.getObject('.')
+    gripperTarget=sim.getObject('./youBot_gripperPositionTarget')
+    gripperTip=sim.getObject('./youBot_gripperPositionTip')
+
+    boxHandle=sim.getObject('/redRectangle1')
+    boxHandle1=sim.getObject('/greenRectangle2')
+    boxHandle2=sim.getObject('/yellowRectangle3')
+
+    armJoints={-1,-1,-1,-1,-1}
+    for i=0,4,1 do
+        armJoints[i+1]=sim.getObject('./youBotArmJoint'..i)
+    end
+
+    gripper=sim.getObject('./youBot_gripper')
+
+    pickupConf={0,-13.39*math.pi/180,-93.91*math.pi/180,-72.72*math.pi/180,90*math.pi/180}
+    homeConf={0,16*math.pi/180,52*math.pi/180,73*math.pi/180,0}
+
+    ikSpeed={0.8}
+    ikAccel={0.6}
+    ikJerk={1.2}
+
+    fkSpeed={2,2,2,2,2}
+    fkAccel={1.5,1.5,1.5,1.5,1.5}
+    fkJerk={2,2,2,2,2}
+
+    ikMetric={1,1,1,0.1}
+
+    ikEnv=simIK.createEnvironment()
+    ikGroup=simIK.createGroup(ikEnv)
+    simIK.setGroupCalculation(ikEnv,ikGroup,simIK.method_damped_least_squares,0.01,100)
+    simIK.addElementFromScene(ikEnv,ikGroup,base,gripperTip,gripperTarget,simIK.constraint_position)
+
+    ikData={}
+    ikData.ikEnv=ikEnv
+    ikData.ikGroup=ikGroup
+    ikData.target=gripperTarget
+
+    local pad=sim.getObject('/pad2')
+    local dropDummy=sim.getObject('/pad2/pad2Drop')
+    local dropDummy1=sim.getObject('/pad2/pad2Drop1')
+    local dropDummy2=sim.getObject('/pad2/pad2Drop2')
+
+    createUI()
+    createGraphStreams()
+
+    setGripperTargetMovingWithVehicle()
+    openGripper()
+
+    pickupBoxFromPlace(boxHandle,pickupConf)
+    placeBoxOnPad2(dropDummy,pad,boxHandle,0.08,homeConf)
+
+    pickupBoxFromPlace(boxHandle1,pickupConf)
+    placeBoxOnPad2(dropDummy1,pad,boxHandle1,0.08,homeConf)
+
+    pickupBoxFromPlace(boxHandle2,pickupConf)
+    placeBoxOnPad2(dropDummy2,pad,boxHandle2,0.08,homeConf)
+
+    sim.moveToConfig(-1,getConfig(armJoints),nil,nil,fkSpeed,fkAccel,fkJerk,homeConf,nil,fkcb,armJoints)
+
+    sim.stopSimulation()
+end
+
+function sysCall_cleanup()
+    if ui then
+        simUI.destroy(ui)
+    end
+    if ikEnv then
+        simIK.eraseEnvironment(ikEnv)
+    end
+end
