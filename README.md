@@ -5,3 +5,14 @@ A YOLOv8-based detection approach is used to identify objects representing sweet
 The system implements coordinated control of the mobile base and robotic arm, enabling object localization, alignment, grasping, and placement onto a designated platform. Real-time monitoring of joint states, end-effector position, and positional error is also incorporated.
 
 This simulation demonstrates the feasibility of autonomous harvesting workflows and highlights the integration of perception-driven control within a robotic manipulation system.
+
+
+
+
+
+https://github.com/user-attachments/assets/e891957b-3453-4d61-9b70-0bda179d041c
+
+
+
+
+
